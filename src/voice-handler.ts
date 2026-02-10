@@ -22,6 +22,7 @@ export class VoiceHandler {
     private isListening = false;
     private isPlaying = false;
     private responseAudioChunks: Buffer[] = [];
+    private activeStreams: Map<string, boolean> = new Map();
 
     constructor(realtimeClient: RealtimeClient) {
         this.realtimeClient = realtimeClient;
@@ -106,20 +107,24 @@ export class VoiceHandler {
         const receiver = this.connection.receiver;
 
         receiver.speaking.on('start', (userId) => {
+            // Skip if we're already processing audio from this user
+            if (this.activeStreams.get(userId)) return;
+            
             console.log(`User ${userId} started speaking`);
+            this.activeStreams.set(userId, true);
             
             const audioStream = receiver.subscribe(userId, {
                 end: {
                     behavior: EndBehaviorType.AfterSilence,
-                    duration: 100
+                    duration: 300
                 }
             });
 
-            this.processUserAudio(audioStream);
+            this.processUserAudio(audioStream, userId);
         });
     }
 
-    private processUserAudio(audioStream: AudioReceiveStream): void {
+    private processUserAudio(audioStream: AudioReceiveStream, userId?: string): void {
         let chunkCount = 0;
 
         // Discord sends opus packets. Decode to PCM 48kHz mono.
@@ -130,7 +135,11 @@ export class VoiceHandler {
         });
 
         opusDecoder.on('error', (error: Error) => {
-            console.error('Opus decoder error:', error.message);
+            // Corrupt frames happen when streams overlap or get interrupted
+            // Just skip them — the Realtime API handles gaps fine
+            if (!error.message.includes('corrupted')) {
+                console.error('Opus decoder error:', error.message);
+            }
         });
 
         audioStream.on('error', (error: Error) => {
@@ -157,11 +166,14 @@ export class VoiceHandler {
         });
 
         decoded.on('end', () => {
+            if (userId) this.activeStreams.delete(userId);
             console.log(`User finished speaking (sent ${chunkCount} audio chunks)`);
         });
 
         decoded.on('error', (error: Error) => {
-            console.error('Decoded stream error:', error.message);
+            if (!error.message.includes('corrupted')) {
+                console.error('Decoded stream error:', error.message);
+            }
         });
     }
 

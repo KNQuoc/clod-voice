@@ -76,9 +76,12 @@ export class RealtimeClient extends EventEmitter {
             session: {
                 modalities: ['text', 'audio'],
                 voice: 'alloy',
-                instructions: `You are Claude, a helpful AI assistant. For simple questions, answer directly with voice. For tasks requiring tools (email, calendar, web search, file operations, running commands, or anything that needs external integrations), use the appropriate function calls to route requests to Claude via OpenClaw.
+                instructions: `You are the voice interface for Clod, Kien's AI assistant. For simple questions, answer directly. For tool tasks, you have two modes:
 
-Be conversational and natural in your voice responses. Keep responses concise unless asked for details. Always respond in English.`,
+QUICK tools (fast, use these first): check_email, check_calendar, search_web, run_command, ask_clod_quick.
+FULL mode (slow but powerful): ask_clod_full — sends to the real Clod with full memory, project context, and workspace access. Use when the user says "ask Clod", references past conversations, projects, or needs deep context. The response will appear in Discord.
+
+Be conversational and concise. Always respond in English.`,
                 turn_detection: {
                     type: 'server_vad',
                     threshold: 0.5,
