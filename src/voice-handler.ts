@@ -14,18 +14,24 @@ import { VoiceBasedChannel, GuildMember } from 'discord.js';
 import * as prism from 'prism-media';
 import { Readable } from 'stream';
 import { RealtimeClient } from './realtime-client';
+import { LuxTTSClient } from './luxtts-client';
 
 export class VoiceHandler {
     private connection: VoiceConnection | null = null;
     private audioPlayer: AudioPlayer;
     private realtimeClient: RealtimeClient;
+    private luxtts: LuxTTSClient;
+    private useLuxTTS: boolean;
     private isListening = false;
     private isPlaying = false;
+    private isSpeaking = false;
     private responseAudioChunks: Buffer[] = [];
     private activeStreams: Map<string, boolean> = new Map();
 
-    constructor(realtimeClient: RealtimeClient) {
+    constructor(realtimeClient: RealtimeClient, luxtts?: LuxTTSClient) {
         this.realtimeClient = realtimeClient;
+        this.luxtts = luxtts || new LuxTTSClient();
+        this.useLuxTTS = !!luxtts;
         this.audioPlayer = createAudioPlayer();
         this.setupAudioPlayer();
         this.setupRealtimeClient();
@@ -34,33 +40,112 @@ export class VoiceHandler {
     private setupAudioPlayer(): void {
         this.audioPlayer.on(AudioPlayerStatus.Playing, () => {
             console.log('Audio player started playing');
+            this.isSpeaking = true;
         });
 
         this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
             console.log('Audio player finished playing');
+            this.isSpeaking = false;
         });
 
         this.audioPlayer.on('error', (error) => {
             console.error('Audio player error:', error);
+            this.isSpeaking = false;
         });
     }
 
     private setupRealtimeClient(): void {
-        this.realtimeClient.on('audio_delta', (audioData: string) => {
-            // Buffer audio chunks until response is complete
-            const pcmChunk = Buffer.from(audioData, 'base64');
-            this.responseAudioChunks.push(pcmChunk);
-        });
+        if (!this.useLuxTTS) {
+            // Original behavior: buffer OpenAI Realtime audio
+            this.realtimeClient.on('audio_delta', (audioData: string) => {
+                const pcmChunk = Buffer.from(audioData, 'base64');
+                this.responseAudioChunks.push(pcmChunk);
+            });
 
-        this.realtimeClient.on('audio_done', () => {
-            // Play the complete response
-            this.playCompleteResponse();
+            this.realtimeClient.on('audio_done', () => {
+                this.playCompleteResponse();
+            });
+        }
+
+        // LuxTTS mode: listen for text responses
+        this.realtimeClient.on('text_response', async (text: string) => {
+            if (this.useLuxTTS) {
+                await this.playWithLuxTTS(text);
+            }
         });
 
         this.realtimeClient.on('speech_started', () => {
             console.log('Speech detected, stopping audio output');
             this.stopPlayback();
         });
+    }
+
+    /**
+     * Synthesize text with LuxTTS and play via Discord.
+     */
+    async playWithLuxTTS(text: string): Promise<void> {
+        try {
+            console.log(`[LuxTTS] Synthesizing: "${text.substring(0, 80)}..."`);
+            const startTime = Date.now();
+
+            const wavBuffer = await this.luxtts.synthesize(text, {
+                numSteps: 6,    // higher quality (default 4)
+                tShift: 0.85,   // slightly lower for cleaner pronunciation
+                speed: 0.85,    // slightly slower for natural pace
+            });
+            const synthTime = Date.now() - startTime;
+            console.log(`[LuxTTS] Synthesized in ${synthTime}ms (${wavBuffer.length} bytes)`);
+
+            // Parse WAV header to find data chunk offset
+            let dataOffset = 44; // default
+            if (wavBuffer.length > 44 && wavBuffer.toString('ascii', 0, 4) === 'RIFF') {
+                // Search for 'data' subchunk
+                for (let i = 12; i < Math.min(wavBuffer.length - 8, 200); i++) {
+                    if (wavBuffer.toString('ascii', i, i + 4) === 'data') {
+                        dataOffset = i + 8; // skip 'data' + 4-byte size
+                        break;
+                    }
+                }
+            }
+            const pcmData = wavBuffer.subarray(dataOffset);
+            console.log(`[LuxTTS] PCM data: ${pcmData.length} bytes (header: ${dataOffset} bytes)`);
+
+            // Mono 16-bit to stereo 16-bit: duplicate each sample (2 bytes per sample)
+            const stereo = Buffer.alloc(pcmData.length * 2);
+            for (let i = 0; i < pcmData.length; i += 2) {
+                const lo = pcmData[i];
+                const hi = pcmData[i + 1];
+                const outIdx = i * 2;
+                stereo[outIdx] = lo;
+                stereo[outIdx + 1] = hi;
+                stereo[outIdx + 2] = lo;
+                stereo[outIdx + 3] = hi;
+            }
+
+            const pcmStream = new Readable({
+                read() {
+                    this.push(stereo);
+                    this.push(null);
+                }
+            });
+
+            const opusEncoder = new prism.opus.Encoder({
+                frameSize: 960,
+                channels: 2,
+                rate: 48000
+            });
+
+            const resource = createAudioResource(pcmStream.pipe(opusEncoder), {
+                inputType: StreamType.Opus,
+            });
+
+            this.audioPlayer.play(resource);
+            this.isPlaying = true;
+            console.log('[LuxTTS] Playback started');
+        } catch (error) {
+            console.error('[LuxTTS] Error:', error);
+            this.isSpeaking = false;
+        }
     }
 
     async joinChannel(channel: VoiceBasedChannel, member: GuildMember): Promise<void> {
@@ -72,14 +157,21 @@ export class VoiceHandler {
             throw new Error('Missing permissions to speak in voice channel');
         }
 
+        console.log(`Joining voice channel: ${channel.id} in guild ${channel.guild.id}`);
+        
         this.connection = joinVoiceChannel({
             channelId: channel.id,
             guildId: channel.guild.id,
             adapterCreator: channel.guild.voiceAdapterCreator as any,
             selfDeaf: false,
             selfMute: false,
-            daveEncryption: false
+            daveEncryption: true,
         } as any);
+
+        // Log all state changes
+        this.connection.on('stateChange', (oldState, newState) => {
+            console.log(`Voice connection: ${oldState.status} -> ${newState.status}`);
+        });
 
         this.connection.on(VoiceConnectionStatus.Ready, () => {
             console.log('Voice connection ready');
@@ -107,7 +199,6 @@ export class VoiceHandler {
         const receiver = this.connection.receiver;
 
         receiver.speaking.on('start', (userId) => {
-            // Skip if we're already processing audio from this user
             if (this.activeStreams.get(userId)) return;
             
             console.log(`User ${userId} started speaking`);
@@ -116,7 +207,7 @@ export class VoiceHandler {
             const audioStream = receiver.subscribe(userId, {
                 end: {
                     behavior: EndBehaviorType.AfterSilence,
-                    duration: 300
+                    duration: 1000
                 }
             });
 
@@ -127,7 +218,6 @@ export class VoiceHandler {
     private processUserAudio(audioStream: AudioReceiveStream, userId?: string): void {
         let chunkCount = 0;
 
-        // Discord sends opus packets. Decode to PCM 48kHz mono.
         const opusDecoder = new prism.opus.Decoder({
             frameSize: 960,
             channels: 1,
@@ -135,8 +225,6 @@ export class VoiceHandler {
         });
 
         opusDecoder.on('error', (error: Error) => {
-            // Corrupt frames happen when streams overlap or get interrupted
-            // Just skip them — the Realtime API handles gaps fine
             if (!error.message.includes('corrupted')) {
                 console.error('Opus decoder error:', error.message);
             }
@@ -146,13 +234,13 @@ export class VoiceHandler {
             console.error('Audio stream error:', error.message);
         });
 
-        // Pipe opus stream through decoder, then manually downsample
         const decoded = audioStream.pipe(opusDecoder);
 
         decoded.on('data', (chunk: Buffer) => {
             chunkCount++;
-            // Input: 48kHz mono s16le (2 bytes per sample)
-            // Output: 24kHz mono s16le — skip every other sample
+            if (this.isSpeaking) return;
+
+            // Downsample 48kHz → 24kHz
             const downsampled = Buffer.alloc(chunk.length / 2);
             for (let i = 0, j = 0; i < chunk.length; i += 4, j += 2) {
                 downsampled[j] = chunk[i];
@@ -181,7 +269,6 @@ export class VoiceHandler {
         if (this.responseAudioChunks.length === 0) return;
 
         try {
-            // Combine all PCM chunks (24kHz 16-bit mono)
             const fullPcm = Buffer.concat(this.responseAudioChunks);
             this.responseAudioChunks = [];
             console.log(`Playing response: ${fullPcm.length} bytes of PCM audio`);
@@ -202,7 +289,6 @@ export class VoiceHandler {
                 upsampled[outIdx + 7] = hi;
             }
 
-            // Create a readable stream from the complete buffer
             const pcmStream = new Readable({
                 read() {
                     this.push(upsampled);
@@ -210,7 +296,6 @@ export class VoiceHandler {
                 }
             });
 
-            // Encode to opus
             const opusEncoder = new prism.opus.Encoder({
                 frameSize: 960,
                 channels: 2,
@@ -248,6 +333,7 @@ export class VoiceHandler {
         this.responseAudioChunks = [];
         this.audioPlayer.stop();
         this.isPlaying = false;
+        this.isSpeaking = false;
     }
 
     private stopListening(): void {

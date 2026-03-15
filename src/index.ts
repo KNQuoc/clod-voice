@@ -2,6 +2,7 @@ import { Client, GatewayIntentBits, VoiceBasedChannel, ChatInputCommandInteracti
 import { VoiceHandler } from './voice-handler';
 import { RealtimeClient } from './realtime-client';
 import { OpenClawBridge } from './openclaw-bridge';
+import { LuxTTSClient } from './luxtts-client';
 import { registerCommands } from './register-commands';
 import * as dotenv from 'dotenv';
 
@@ -12,6 +13,7 @@ class DiscordVoiceBot {
     private realtimeClient: RealtimeClient;
     private openClawBridge: OpenClawBridge;
     private voiceHandler: VoiceHandler;
+    private luxtts: LuxTTSClient | null = null;
 
     constructor() {
         // Initialize Discord client with necessary intents
@@ -29,14 +31,36 @@ class DiscordVoiceBot {
             process.env.OPENCLAW_GATEWAY_TOKEN!
         );
 
+        // Initialize LuxTTS if enabled
+        const useLuxTTS = process.env.USE_LUXTTS !== 'false'; // default: on
+        if (useLuxTTS) {
+            const luxttsUrl = process.env.LUXTTS_URL || 'http://localhost:8099';
+            this.luxtts = new LuxTTSClient(luxttsUrl);
+            console.log(`LuxTTS enabled: ${luxttsUrl}`);
+        }
+
         // Initialize Realtime client
+        // directToClod: use OpenAI only for STT, route all responses through Clod
+        const directToClod = useLuxTTS; // when LuxTTS is on, go direct to Clod
         this.realtimeClient = new RealtimeClient(
             process.env.OPENAI_API_KEY!,
-            this.openClawBridge
+            this.openClawBridge,
+            useLuxTTS,
+            directToClod
         );
 
         // Initialize voice handler
-        this.voiceHandler = new VoiceHandler(this.realtimeClient);
+        this.voiceHandler = new VoiceHandler(
+            this.realtimeClient,
+            this.luxtts || undefined
+        );
+
+        // Wire up async response delivery: when Clod responds in the background,
+        // inject it into the Realtime API conversation to be spoken aloud
+        this.openClawBridge.onAsyncResponse = (text: string) => {
+            console.log('Async response from Clod, injecting into voice...');
+            this.realtimeClient.injectAsyncResponse(text);
+        };
 
         this.setupEventHandlers();
     }

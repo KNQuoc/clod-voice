@@ -4,10 +4,53 @@ import { execSync } from 'child_process';
 export class OpenClawBridge {
     private gatewayUrl: string;
     private token: string;
+    private pendingResponses: Array<{ id: string; resolve: (text: string) => void }> = [];
+    public onAsyncResponse: ((text: string) => void) | null = null;
 
     constructor(gatewayUrl: string, token: string) {
         this.gatewayUrl = gatewayUrl;
         this.token = token;
+    }
+
+    /**
+     * Conversation mode: Send full chat history to Clod for context-aware responses.
+     */
+    async askClodWithHistory(messages: Array<{ role: string; content: string }>): Promise<string> {
+        try {
+            const formattedMessages = [
+                {
+                    role: 'system',
+                    content: '[Voice request from Kien via Discord voice chat. Respond concisely in 2-3 sentences max — this will be read aloud via TTS. Be conversational. You have full access to tools, memory, and workspace.]'
+                },
+                ...messages
+            ];
+
+            const response = await fetch(`${this.gatewayUrl}/v1/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: 'openclaw:main',
+                    messages: formattedMessages
+                })
+            });
+
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(`OpenClaw API error: ${response.status} - ${text}`);
+            }
+
+            const data = await response.json() as any;
+            if (data.choices?.[0]?.message?.content) {
+                return data.choices[0].message.content;
+            }
+            return 'No response from OpenClaw.';
+        } catch (error) {
+            console.error('Error communicating with OpenClaw (history):', error);
+            return `Sorry, I couldn't reach Clod right now: ${error instanceof Error ? error.message : String(error)}`;
+        }
     }
 
     /**
@@ -50,27 +93,46 @@ export class OpenClawBridge {
     }
 
     /**
-     * Full mode: Chat completions with a persistent session.
-     * Has full context, memory, workspace — slower but it's the real Clod.
-     * Uses the `user` field to maintain a stable session across calls.
+     * Full mode: Fire-and-forget request to Clod.
+     * Returns immediately with an acknowledgment so the voice bot stays responsive.
+     * When Clod's response arrives, it's delivered via onAsyncResponse callback.
      */
     async askClodFull(message: string): Promise<string> {
+        // Fire the request in the background
+        this.fetchClodResponse(message).catch(error => {
+            console.error('Background Clod request failed:', error);
+            if (this.onAsyncResponse) {
+                this.onAsyncResponse(`Sorry, I couldn't reach Clod: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        });
+
+        // Return immediately so the Realtime API stays responsive
+        return "Got it, I'm asking Clod now. Keep talking — I'll let you know when he responds.";
+    }
+
+    /**
+     * Background fetch using the chat completions endpoint.
+     * This creates an isolated completion (not tied to main session),
+     * so it won't conflict with ongoing conversations.
+     */
+    private async fetchClodResponse(message: string): Promise<void> {
         try {
-            // Spawn a sub-agent task — it runs in the background and announces
-            // the result in Discord. We return immediately to voice.
-            const response = await fetch(`${this.gatewayUrl}/tools/invoke`, {
+            console.log('[askClodFull] Sending request via chat completions...');
+            
+            const response = await fetch(`${this.gatewayUrl}/v1/chat/completions`, {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${this.token}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    tool: 'sessions_spawn',
-                    args: {
-                        task: `[Voice request from Kien] ${message}\n\nRespond concisely. Deliver your answer to Discord channel #ask-clod (channel ID: 1470503902309781595).`,
-                        label: 'voice-request',
-                        cleanup: 'delete'
-                    }
+                    model: 'openclaw:main',
+                    messages: [
+                        {
+                            role: 'user',
+                            content: `[Voice request from Kien — respond concisely in 2-3 sentences max, this will be read aloud via TTS. You have access to all tools including Canvas LMS, email, calendar, web search, etc.] ${message}`
+                        }
+                    ]
                 })
             });
 
@@ -80,13 +142,29 @@ export class OpenClawBridge {
             }
 
             const data = await response.json() as any;
-            if (data.ok) {
-                return "I've sent that to Clod. He'll respond in the ask-clod Discord channel shortly.";
+            console.log('[askClodFull] Response received');
+
+            // Chat completions returns standard OpenAI format
+            let reply: string | null = null;
+            
+            if (data.choices?.[0]?.message?.content) {
+                reply = data.choices[0].message.content;
+            } else {
+                console.log('[askClodFull] Unexpected shape:', JSON.stringify(data).substring(0, 500));
+                reply = JSON.stringify(data);
             }
-            return `Error: ${JSON.stringify(data)}`;
+
+            const finalReply = reply || 'Clod responded but the reply was empty.';
+            console.log(`[askClodFull] Clod responded (${finalReply.length} chars), delivering to voice...`);
+
+            // Deliver via callback → gets injected into Realtime API conversation
+            if (this.onAsyncResponse) {
+                this.onAsyncResponse(finalReply);
+            } else {
+                console.warn('No async response handler set — Clod reply dropped');
+            }
         } catch (error) {
-            console.error('Error communicating with OpenClaw (full):', error);
-            return `Sorry, I couldn't reach Clod right now: ${error instanceof Error ? error.message : String(error)}`;
+            throw error;
         }
     }
 
@@ -181,7 +259,7 @@ export const openClawFunctions = [
     {
         type: "function" as const,
         name: "ask_clod_full",
-        description: "Full mode: Send a request to the REAL Clod with full context — memory, workspace, project knowledge, personal preferences. Use this for complex tasks, anything referencing past conversations, projects (like blockd4), personal context, or when the user explicitly says 'ask Clod' or needs the real assistant. Slower but much more capable. Response will be posted in Discord.",
+        description: "Full mode: Send a request to the REAL Clod with full context — memory, workspace, project knowledge, personal preferences. Use this for complex tasks, anything referencing past conversations, projects (like blockd4), personal context, or when the user explicitly says 'ask Clod' or needs the real assistant. Slower but much more capable. The response comes back as text — READ IT ALOUD to the user.",
         parameters: {
             type: "object",
             properties: {
